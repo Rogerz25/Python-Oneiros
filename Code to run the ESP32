@@ -1,0 +1,172 @@
+/*
+  ONEIROS - AD8232 ECG + MAX30105 (BPM + SpO2) on Arduino Nano ESP32
+
+  Wiring:
+    AD8232:   OUTPUT -> A0, LO+ -> D2, LO- -> D3, 3.3V, GND
+    MAX30105: SDA -> A4, SCL -> A5, VIN -> 3.3V, GND
+
+  Output (one line every SAMPLE_INTERVAL):
+    Time:<ms>,ADC:<0-4095>,Volts:<v>,LeadsOff:<0/1>,BPM:<n>,SpO2:<n>,TempF:<f>
+  Works in Serial Plotter and Serial Monitor.
+  BPM and SpO2 update slowly; their last value is repeated on each line.
+*/
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+
+// ---------- AD8232 ----------
+const int ECG_PIN = A0;
+const int LO_PLUS_PIN = D2;
+const int LO_MINUS_PIN = D3;
+const float ADC_REF_VOLTS = 3.3;
+const int ADC_MAX = 4095;                    // 12-bit
+const unsigned long SAMPLE_INTERVAL = 6000;  // us
+unsigned long nextSampleMicros = 0;
+
+// ---------- MAX30105 ----------
+MAX30105 particleSensor;
+
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute;
+int beatAvg = 0;
+
+#define BUFFER_SIZE 100
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+byte bufferIndex = 0;
+int32_t spo2 = 0;
+int8_t validSPO2 = 0;
+int32_t heartRateAlgo;
+int8_t validHeartRate;
+
+// ---------- Temperature (non-blocking) ----------
+// Calibration offset in degrees F, ADDED to the sensor reading. Set to match your old sketch.
+const float TEMP_OFFSET_F = 0.0;
+const unsigned long TEMP_INTERVAL_MS = 10000;  // take a temperature reading every 10 s
+const uint8_t MAX_ADDR = 0x57;
+float temperatureF = 0;
+unsigned long tempStartedAt = 0;
+unsigned long lastTempStart = 0;
+bool tempConverting = false;
+
+void setup() {
+  Serial.begin(230400);
+
+  pinMode(LO_PLUS_PIN, INPUT);
+  pinMode(LO_MINUS_PIN, INPUT);
+  analogReadResolution(12);
+
+  Wire.begin();
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 was not found. Please check wiring/power.");
+    while (1);
+  }
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x1F);
+  particleSensor.setPulseAmplitudeIR(0x1F);
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  delay(1000);
+  nextSampleMicros = micros();
+}
+
+void updateMax30105() {
+  particleSensor.check();
+
+  while (particleSensor.available()) {
+    long irValue = particleSensor.getFIFOIR();
+    long redValue = particleSensor.getFIFORed();
+
+    if (checkForBeat(irValue)) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+        beatAvg /= RATE_SIZE;
+      }
+    }
+
+    irBuffer[bufferIndex] = irValue;
+    redBuffer[bufferIndex] = redValue;
+    bufferIndex++;
+
+    if (bufferIndex == BUFFER_SIZE) {
+      maxim_heart_rate_and_oxygen_saturation(
+        irBuffer, BUFFER_SIZE, redBuffer,
+        &spo2, &validSPO2, &heartRateAlgo, &validHeartRate);
+      bufferIndex = 0;
+    }
+
+    particleSensor.nextSample();
+  }
+}
+
+// Start a die-temp conversion every TEMP_INTERVAL_MS, read the result ~40 ms later.
+// Never waits, so ECG sampling is not disturbed.
+void updateTemperature() {
+  unsigned long ms = millis();
+
+  if (!tempConverting && ms - lastTempStart >= TEMP_INTERVAL_MS) {
+    lastTempStart = ms;
+    tempStartedAt = ms;
+    Wire.beginTransmission(MAX_ADDR);
+    Wire.write(0x21);  // DIE_TEMP_CONFIG
+    Wire.write(0x01);  // start one conversion
+    Wire.endTransmission();
+    tempConverting = true;
+  } else if (tempConverting && ms - tempStartedAt >= 40) {
+    Wire.beginTransmission(MAX_ADDR);
+    Wire.write(0x1F);  // DIE_TEMP_INT, then DIE_TEMP_FRAC
+    Wire.endTransmission(false);
+    Wire.requestFrom(MAX_ADDR, (uint8_t)2);
+    if (Wire.available() >= 2) {
+      int8_t whole = (int8_t)Wire.read();
+      uint8_t frac = Wire.read();
+      float tempC = (float)whole + ((float)frac * 0.0625);
+      temperatureF = tempC * 9.0 / 5.0 + 32.0 + TEMP_OFFSET_F;
+    }
+    tempConverting = false;
+  }
+}
+
+void loop() {
+  // Keep the pulse sensor FIFO drained (fast, non-blocking)
+  updateMax30105();
+  updateTemperature();
+
+  // ECG sample on a fixed schedule
+  unsigned long now = micros();
+  if ((long)(now - nextSampleMicros) >= 0) {
+    nextSampleMicros += SAMPLE_INTERVAL;
+
+    unsigned long timeMs = millis();
+    int adc = analogRead(ECG_PIN);
+    float volts = adc * ADC_REF_VOLTS / ADC_MAX;
+    int leadsOff = (digitalRead(LO_PLUS_PIN) == HIGH || digitalRead(LO_MINUS_PIN) == HIGH);
+
+    Serial.print("Time:");
+    Serial.print(timeMs);
+    Serial.print(",ADC:");
+    Serial.print(adc);
+    Serial.print(",Volts:");
+    Serial.print(volts, 4);
+    Serial.print(",LeadsOff:");
+    Serial.print(leadsOff);
+    Serial.print(",BPM:");
+    Serial.print(beatAvg);
+    Serial.print(",SpO2:");
+    Serial.print(validSPO2 ? spo2 : 0);
+    Serial.print(",TempF:");
+    Serial.println(temperatureF, 1);
+  }
+}
