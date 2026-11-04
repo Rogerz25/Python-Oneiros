@@ -1,0 +1,233 @@
+"""
+Oneiros logger: reads the combined ECG + MAX30105 sketch over serial and saves a
+NEW Excel workbook on every run, with separate tabs:
+
+    ECG     - every sample: time, ADC, volts, LeadsOff
+    Vitals  - one row per second: time, BPM, SpO2, TempF
+    Info    - name, start time, sample counts, measured sample rate
+
+Expected serial line from the Arduino sketch:
+    Time:<ms>,ADC:<0-4095>,Volts:<v>,LeadsOff:<0/1>,BPM:<n>,SpO2:<n>,TempF:<f>
+
+Timestamps come from the Arduino's own millis() clock, so changing the sketch's
+SAMPLE_INTERVAL needs no change here.
+
+Safety: every line is also appended live to a plain .csv next to the workbook,
+so nothing is lost if the script or PC crashes. The .xlsx is written when you
+press Ctrl+C (or the serial port disconnects).
+
+Install:  pip install pyserial openpyxl
+"""
+
+import csv
+import os
+import sys
+import time
+from datetime import datetime
+
+import serial
+import serial.tools.list_ports
+from openpyxl import Workbook
+from openpyxl.chart import LineChart, Reference
+from openpyxl.styles import Font, PatternFill, Alignment
+
+BAUD = 230400
+# Save outside OneDrive-synced folders if you can (OneDrive locking corrupted files before)
+OUT_DIR = os.path.join(os.path.expanduser("~"), "Oneiros_Logs")
+
+# Color per column: (header fill, data font color)
+COLORS = {
+    "Time (s)":   ("808080", "404040"),
+    "Wall Clock": ("A0A0A0", "404040"),
+    "ADC":        ("C00000", "C00000"),
+    "Volts":      ("7030A0", "7030A0"),
+    "LeadsOff":   ("ED7D31", "C55A11"),
+    "BPM":        ("2E75B6", "1F4E79"),
+    "SpO2":       ("00B0F0", "0070C0"),
+    "TempF":      ("70AD47", "375623"),
+}
+
+
+def pick_port():
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        sys.exit("No serial ports found. Plug in the Arduino and close the Arduino IDE Serial Monitor/Plotter.")
+    print("Available ports:")
+    for i, p in enumerate(ports):
+        print(f"  [{i}] {p.device} - {p.description}")
+    choice = input("Pick port number: ").strip()
+    return ports[int(choice)].device
+
+
+def parse_line(line):
+    """'Time:1234,ADC:2048,Volts:1.6504,LeadsOff:0,BPM:72,SpO2:98,TempF:91.4' -> dict, or None."""
+    try:
+        d = {}
+        for part in line.split(","):
+            k, v = part.split(":")
+            d[k.strip()] = float(v)
+        if "ADC" not in d or "Time" not in d:
+            return None
+        return d
+    except ValueError:
+        return None
+
+
+def style_sheet(ws, headers):
+    for col, h in enumerate(headers, start=1):
+        fill, _ = COLORS[h]
+        c = ws.cell(row=1, column=col, value=h)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor=fill)
+        c.alignment = Alignment(horizontal="center")
+        ws.column_dimensions[c.column_letter].width = 14
+    ws.freeze_panes = "A2"
+
+
+def add_rows(ws, rows, headers):
+    fonts = [Font(color=COLORS[h][1]) for h in headers]
+    for r in rows:
+        ws.append(r)
+    for col, font in enumerate(fonts, start=1):
+        for cell in ws.iter_cols(min_col=col, max_col=col, min_row=2, max_row=ws.max_row):
+            for c in cell:
+                c.font = font
+
+
+def build_workbook(path, name, start, ecg_rows, vitals_rows):
+    wb = Workbook()
+
+    # ---- ECG tab ----
+    ws_ecg = wb.active
+    ws_ecg.title = "ECG"
+    ecg_headers = ["Time (s)", "Wall Clock", "ADC", "Volts", "LeadsOff"]
+    style_sheet(ws_ecg, ecg_headers)
+    add_rows(ws_ecg, ecg_rows, ecg_headers)
+    ws_ecg.column_dimensions["D"].width = 12
+
+    # ---- Vitals tab ----
+    ws_v = wb.create_sheet("Vitals")
+    v_headers = ["Time (s)", "Wall Clock", "BPM", "SpO2", "TempF"]
+    style_sheet(ws_v, v_headers)
+    add_rows(ws_v, vitals_rows, v_headers)
+
+    # ---- Info tab ----
+    duration = ecg_rows[-1][0] if ecg_rows else 0
+    rate = (len(ecg_rows) - 1) / duration if duration > 0 else 0
+    ws_i = wb.create_sheet("Info")
+    ws_i.append(["Name", name])
+    ws_i.append(["Start", start.strftime("%Y-%m-%d %H:%M:%S")])
+    ws_i.append(["ECG samples", len(ecg_rows)])
+    ws_i.append(["Duration (s)", round(duration, 1)])
+    ws_i.append(["Avg sample rate (Hz)", round(rate, 1)])
+    ws_i.column_dimensions["A"].width = 22
+    ws_i.column_dimensions["B"].width = 24
+
+    # ---- Charts ----
+    if len(ecg_rows) > 1:
+        # first 10 s so the chart stays readable
+        n = sum(1 for r in ecg_rows if r[0] <= 10)
+        n = max(n, 2)
+        ch = LineChart()
+        ch.title = "ECG (first 10 s)"
+        ch.y_axis.title = "ADC counts"
+        ch.x_axis.title = "Time (s)"
+        ch.add_data(Reference(ws_ecg, min_col=3, min_row=1, max_row=n + 1), titles_from_data=True)
+        ch.set_categories(Reference(ws_ecg, min_col=1, min_row=2, max_row=n + 1))
+        ch.legend = None
+        ch.height, ch.width = 9, 22
+        ws_ecg.add_chart(ch, "H2")
+
+    if len(vitals_rows) > 1:
+        ch = LineChart()
+        ch.title = "BPM and SpO2"
+        ch.y_axis.title = "Value"
+        ch.x_axis.title = "Seconds"
+        ch.add_data(Reference(ws_v, min_col=3, max_col=4, min_row=1, max_row=len(vitals_rows) + 1),
+                    titles_from_data=True)
+        ch.set_categories(Reference(ws_v, min_col=1, min_row=2, max_row=len(vitals_rows) + 1))
+        ch.height, ch.width = 9, 22
+        ws_v.add_chart(ch, "H2")
+
+        ch2 = LineChart()
+        ch2.title = "Temperature (F)"
+        ch2.y_axis.title = "Degrees F"
+        ch2.x_axis.title = "Seconds"
+        ch2.add_data(Reference(ws_v, min_col=5, min_row=1, max_row=len(vitals_rows) + 1),
+                     titles_from_data=True)
+        ch2.set_categories(Reference(ws_v, min_col=1, min_row=2, max_row=len(vitals_rows) + 1))
+        ch2.height, ch2.width = 9, 22
+        ws_v.add_chart(ch2, "H21")
+
+    wb.save(path)
+
+
+def main():
+    name = input("Name: ").strip() or "Unknown"
+    port = pick_port()
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    start = datetime.now()
+    stamp = start.strftime("%Y%m%d_%H%M%S")
+    safe_name = "".join(ch for ch in name if ch.isalnum() or ch in "-_") or "Unknown"
+    base = os.path.join(OUT_DIR, f"Oneiros_{safe_name}_{stamp}")  # new file every run
+    xlsx_path, csv_path = base + ".xlsx", base + ".csv"
+
+    ecg_rows, vitals_rows = [], []
+    last = {"BPM": 0, "SpO2": 0, "TempF": 0.0}
+    first_ms = None
+    next_vitals_t = 0.0
+
+    print(f"\nLogging to {xlsx_path}\nPress Ctrl+C to stop and save.\n")
+
+    ser = serial.Serial(port, BAUD, timeout=1)
+    time.sleep(2)
+    ser.reset_input_buffer()
+
+    with open(csv_path, "w", newline="") as f:
+        raw = csv.writer(f)
+        raw.writerow(["Time (s)", "Wall Clock", "ADC", "Volts", "LeadsOff", "BPM", "SpO2", "TempF"])
+        try:
+            while True:
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                d = parse_line(line)
+                if d is None:
+                    continue
+
+                # Time from the Arduino's clock, zeroed at the first sample
+                if first_ms is None:
+                    first_ms = d["Time"]
+                t = (d["Time"] - first_ms) / 1000.0
+
+                wall = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                adc = int(d["ADC"])
+                volts = round(d.get("Volts", adc * 3.3 / 4095), 4)
+                leads = int(d.get("LeadsOff", 0))
+                for k in last:
+                    if k in d:
+                        last[k] = d[k]
+
+                ecg_rows.append([round(t, 3), wall, adc, volts, leads])
+                raw.writerow([round(t, 3), wall, adc, volts, leads, last["BPM"], last["SpO2"], last["TempF"]])
+
+                if t >= next_vitals_t:  # one vitals row per second
+                    vitals_rows.append([round(t, 1), wall, int(last["BPM"]), int(last["SpO2"]), last["TempF"]])
+                    next_vitals_t = int(t) + 1
+                    f.flush()
+                    print(f"{t:7.1f}s  ADC={adc:4d}  V={volts:.4f}  BPM={int(last['BPM']):3d}  "
+                          f"SpO2={int(last['SpO2']):3d}  Temp={last['TempF']:.1f}F"
+                          f"{'  LEADS OFF' if leads else ''}")
+        except KeyboardInterrupt:
+            print("\nStopping...")
+        except serial.SerialException as e:
+            print(f"\nSerial error: {e}")
+        finally:
+            ser.close()
+
+    print(f"Building Excel file ({len(ecg_rows)} ECG samples)...")
+    build_workbook(xlsx_path, name, start, ecg_rows, vitals_rows)
+    print(f"Saved: {xlsx_path}\nBackup CSV: {csv_path}")
+
+
+if __name__ == "__main__":
+    main()
